@@ -1,0 +1,71 @@
+# skrl TRPO configuration for PointMaze (stock skrl 2.1 model/agent format).
+# TRPO updates the policy with a constrained (trust-region) step, so there is no
+# policy learning rate — only the value network is trained by gradient descent.
+seed: 42
+
+models:
+  separate: true
+  policy:  # gaussian_model
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ACTIONS
+  value:  # deterministic_model
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1  # auto (= agent.rollouts)
+
+agent:
+  class: TRPO
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 3.0e-04  # value network only
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  value_loss_scale: 1.0
+  damping: 0.1
+  max_kl_divergence: 0.01
+  conjugate_gradient_steps: 10
+  max_backtrack_steps: 10
+  accept_ratio: 0.5
+  step_fraction: 1.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: true
+  experiment:
+    directory: pointmaze
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      project: explorationRL
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 100000
+  environment_info: log

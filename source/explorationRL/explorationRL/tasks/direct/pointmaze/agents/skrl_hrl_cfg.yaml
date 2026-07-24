@@ -1,0 +1,96 @@
+# skrl HRL configuration for PointMaze.
+# HRL = a categorical controller sequencing intrinsic-reward options, with
+# semi-MDP option execution (see explorationRL/agents/skrl/hrl.py).
+seed: 42
+
+models:
+  # separate networks: each option policy is a deep copy of `policy`, so a
+  # shared policy/value trunk would be duplicated per option (and its cached
+  # forward pass aliases across roles — see irpo.py's act()).
+  separate: true
+  policy:  # gaussian_model
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ACTIONS
+  value:  # deterministic_model
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1  # auto (= agent.rollouts)
+
+agent:
+  class: HRL
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 3.0e-04
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.01
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale: 0.0
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: true
+  # ── HRL ───────────────────────────────────────────────────────────────────
+  num_options: 4
+  option_horizon: 8               # semi-MDP: steps an option runs before re-selection
+  controller_learning_rate: 0.0003
+  controller_epochs: 4
+  controller_ratio_clip: 0.2
+  controller_hidden_dim: [256, 256]
+  controller_entropy_scale: 0.01
+  option_learning_rate: 0.0003    # 0.0 freezes options (legacy Phase-2 behaviour)
+  option_epochs: 4
+  option_ratio_clip: 0.2
+  intrinsic_discount: 0.99
+  intrinsic_reward_type: allo
+  # ALLO representation learner
+  extractor_feature_dim: 8
+  extractor_hidden_dim: [256, 256]
+  extractor_learning_rate: 0.001
+  extractor_batch_size: 512
+  extractor_discount: 0.9
+  extractor_updates_per_rollout: 1
+  extractor_positional_indices: [0, 1]
+  experiment:
+    directory: pointmaze
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      project: explorationRL
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 100000
+  environment_info: log

@@ -1,0 +1,27 @@
+label: htrpo
+algorithm: htrpo
+# HTRPO is TRPO-based (on-policy). Each hindsight goal adds a full copy of the
+# rollout to the update batch, so keep num_envs moderate.
+num_envs: 1024
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  # TRPO backbone
+  agent.discount_factor:
+    values: [0.98, 0.99, 0.995]
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.97]
+  agent.max_kl_divergence:
+    values: [0.005, 0.01, 0.02]
+  agent.learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  # hindsight
+  agent.num_hindsight_goals:
+    values: [2, 4, 8]
+  agent.use_hindsight_goal_filtering:
+    values: [true, false]
+  agent.use_weighted_importance_sampling:
+    values: [true, false]

@@ -1,0 +1,22 @@
+label: trpo
+algorithm: trpo
+# TRPO is on-policy (trust-region) and benefits from massively parallel envs.
+num_envs: 4096
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  agent.discount_factor:
+    values: [0.95, 0.98, 0.99, 0.995]
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.97, 1.0]
+  agent.max_kl_divergence:
+    values: [0.005, 0.01, 0.02]
+  agent.learning_rate:  # value network only
+    values: [0.0001, 0.0003, 0.001]
+  agent.conjugate_gradient_steps:
+    values: [10, 15, 20]
+  agent.damping:
+    values: [0.05, 0.1, 0.2]

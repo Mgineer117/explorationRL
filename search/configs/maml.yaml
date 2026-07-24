@@ -1,0 +1,22 @@
+label: maml
+algorithm: maml
+num_envs: 4096
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  agent.discount_factor:
+    values: [0.98, 0.99, 0.995]
+  # meta-learning
+  agent.inner_learning_rate:
+    values: [0.01, 0.05, 0.1, 0.5]
+  agent.inner_steps:
+    values: [1, 2, 4]
+  agent.meta_learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  agent.support_fraction:
+    values: [0.25, 0.5, 0.75]
+  agent.inner_ratio_clip:
+    values: [0.1, 0.2, 0.3]

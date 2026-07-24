@@ -1,0 +1,26 @@
+label: psne
+algorithm: psne
+# PSNE is TRPO-based (on-policy) and benefits from massively parallel envs.
+num_envs: 4096
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  # TRPO backbone
+  agent.discount_factor:
+    values: [0.98, 0.99, 0.995]
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.97]
+  agent.max_kl_divergence:
+    values: [0.005, 0.01, 0.02]
+  agent.learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  # parameter-space noise
+  agent.initial_noise_std:
+    values: [0.01, 0.05, 0.1, 0.2]
+  agent.noise_adaptation_coefficient:
+    values: [1.005, 1.01, 1.02]
+  agent.noise_kl_threshold:
+    values: [0.01, 0.03, 0.05]

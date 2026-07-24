@@ -1,0 +1,22 @@
+label: sac
+algorithm: sac
+# SAC is off-policy: far fewer parallel envs, large replay buffer.
+num_envs: 64
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  agent.discount_factor:
+    values: [0.95, 0.98, 0.99, 0.995]
+  agent.learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  agent.polyak:
+    values: [0.001, 0.005, 0.01]
+  agent.batch_size:
+    values: [1024, 4096, 8192]
+  agent.initial_entropy_value:
+    values: [0.1, 0.2, 0.5]
+  agent.gradient_steps:
+    values: [1, 2, 4]

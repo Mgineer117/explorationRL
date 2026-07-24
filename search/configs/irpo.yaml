@@ -1,0 +1,31 @@
+label: irpo
+algorithm: irpo
+# IRPO is PPO-based (on-policy) and benefits from massively parallel envs.
+num_envs: 4096
+
+metric:
+  name: "Reward / Total reward (mean)"
+  goal: maximize
+
+parameters:
+  # PPO backbone
+  agent.discount_factor:
+    values: [0.98, 0.99, 0.995]
+  agent.gae_lambda:
+    values: [0.9, 0.95, 0.97]
+  agent.learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  # IRPO exploration
+  agent.num_options:
+    values: [2, 4, 8]
+  agent.option_learning_rate:
+    values: [0.0001, 0.0003, 0.001]
+  agent.option_epochs:
+    values: [2, 4, 8]
+  agent.intrinsic_reward_type:
+    values: [allo, random]
+  # representation
+  agent.extractor_learning_rate:
+    values: [0.0003, 0.001, 0.003]
+  agent.extractor_discount:
+    values: [0.8, 0.9, 0.95]
