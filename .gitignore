@@ -179,3 +179,6 @@ logs/
 model/
 outputs/
 wandb/
+
+# experiment outputs
+results/

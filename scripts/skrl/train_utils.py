@@ -55,13 +55,190 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
 
 
 def install_wandb_scalar_hook() -> None:
-    """Best-effort: make skrl's ``track_data`` scalars also reach ``wandb.log``.
+    """Mirror skrl's TensorBoard scalars into ``wandb.log``.
 
-    skrl already mirrors its writer to W&B when ``experiment.wandb`` is true, so
-    this is a no-op unless that path is unavailable. Kept as a named hook so the
-    call sites read the same as contractionRL's train.py.
+    ``wandb.init(sync_tensorboard=True)`` works by patching *torch's* /
+    tensorboardX's ``SummaryWriter``. skrl >= 2.0 ships its own minimal writer
+    (``skrl.utils.tensorboard.SummaryWriter``, note the keyword-only
+    ``add_scalar(tag=, value=, timestep=)`` signature), which that patch never
+    touches — so every scalar lands in the event file and *nothing* reaches W&B,
+    leaving runs that show Media and no charts. Patch skrl's writer directly.
+
+    Idempotent, and logs at the trainer timestep so scalars line up with the
+    videos ``upload_videos_to_wandb`` logs at the same step.
     """
-    return None
+    try:
+        from skrl.utils.tensorboard import SummaryWriter
+    except ImportError:
+        return
+    if getattr(SummaryWriter, "_wandb_hooked", False):
+        return
+    original_add_scalar = SummaryWriter.add_scalar
+
+    def add_scalar(self, *, tag: str, value: float, timestep: int) -> None:
+        original_add_scalar(self, tag=tag, value=value, timestep=timestep)
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log({tag: value}, step=int(timestep))
+        except Exception:  # noqa: BLE001 — logging must never fail training
+            pass
+
+    SummaryWriter.add_scalar = add_scalar
+    SummaryWriter._wandb_hooked = True
+
+
+def warmup_video_pipeline(env, num_renders: int = 16, max_polls: int = 32) -> None:
+    """Build the rgb annotator against a warm renderer, and prove it produces pixels.
+
+    ``DirectRLEnv.render()`` creates the render product and the ``rgb`` annotator
+    together, on the first call. Both failure modes we hit come from that timing:
+
+    * created at training step 0, before the RTX renderer emitted anything, the
+      SDG graph is wired against empty buffers and ``omni.syntheticdata`` raises
+      ``TypeError: Unable to write from unknown dtype, kind=f, size=0``;
+    * created after only a couple of renders, the graph comes up *without* a
+      valid ``LdrColorSD`` input (the ``SdRenderVarPtr missing valid input
+      renderVar LdrColorSDhost`` warning). ``get_data()`` then returns an empty
+      array forever, and Isaac Lab quietly substitutes zeros — every recorded
+      frame is black, with no error anywhere.
+
+    So: make the render product first, render enough frames that ``LdrColorSD``
+    actually exists, only then attach the annotator, and poll until real pixels
+    come out. If they never do, say so loudly — silent black videos are the whole
+    problem being fixed here.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+    try:
+        import numpy as np
+        import omni.replicator.core as rep
+
+        resolution = unwrapped.cfg.viewer.resolution
+
+        def build(camera, label: str):
+            """Attach an rgb annotator to ``camera`` and report whether it yields pixels."""
+            for _ in range(num_renders):
+                unwrapped.sim.render()
+            render_product = rep.create.render_product(camera, resolution)
+            for _ in range(num_renders):
+                unwrapped.sim.render()
+            annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+            annotator.attach([render_product])
+            for _ in range(max_polls):
+                unwrapped.sim.render()
+                data = np.frombuffer(annotator.get_data(), dtype=np.uint8)
+                if data.size and data.any():
+                    print(f"[INFO] Video pipeline live on {label}.")
+                    return render_product, annotator, True
+            return render_product, annotator, False
+
+        # The viewport camera is the cheap path, but headless runs have no
+        # viewport driving /OmniverseKit_Persp, so its render var often stays
+        # empty and every frame comes out black.
+        render_product, annotator, ok = build(unwrapped.cfg.viewer.cam_prim_path, "the viewport camera")
+        if not ok:
+            print("[INFO] Viewport camera yielded no pixels (headless has no viewport) — "
+                  "falling back to a dedicated recording camera.")
+            camera = rep.create.camera(
+                position=tuple(unwrapped.cfg.viewer.eye), look_at=tuple(unwrapped.cfg.viewer.lookat)
+            )
+            render_product, annotator, ok = build(camera, "a dedicated recording camera")
+        if not ok:
+            print("[WARN] No camera produced pixels — videos will be black. Verify the run has "
+                  "--enable_cameras and that the GPU supports RTX rendering.")
+
+        # Hand the warmed pair to Isaac Lab so render() reuses them instead of
+        # lazily building its own cold ones.
+        unwrapped._render_product = render_product
+        unwrapped._rgb_annotator = annotator
+    except Exception as exc:  # noqa: BLE001 — warm-up is advisory, not required
+        print(f"[WARN] Video pipeline warm-up failed ({exc}); recording may be unstable.")
+    make_render_robust(env)
+
+
+def make_render_robust(env) -> None:
+    """Keep ``render()`` alive across the long gaps between recorded clips.
+
+    Replicator tears the rgb annotator off its render product when thousands of
+    training steps pass with nothing rendering (``SdRenderVarPtr missing valid
+    input renderVar LdrColorSDhost``), so the next capture dies with
+    ``AnnotatorError: annotator is not attached to any render products``. Before
+    each frame we re-attach a detached annotator, and if even that fails we drop
+    the cached objects so Isaac Lab rebuilds them from scratch. A capture that
+    still cannot produce a frame yields a black one — a missing video must never
+    take down a training run that is otherwise fine.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+    if getattr(unwrapped, "_render_is_robust", False):
+        return
+    original_render = unwrapped.render
+    unwrapped._black_frame_warned = False
+
+    def render(recompute: bool = False):
+        annotator = getattr(unwrapped, "_rgb_annotator", None)
+        if annotator is not None and not annotator.is_attached:
+            try:
+                annotator.attach([unwrapped._render_product])
+            except Exception:  # noqa: BLE001 — fall back to a full rebuild
+                for attr in ("_rgb_annotator", "_render_product"):
+                    if hasattr(unwrapped, attr):
+                        delattr(unwrapped, attr)
+        import numpy as np
+
+        try:
+            frame = original_render(recompute=recompute)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Frame capture failed ({exc}); emitting a black frame.")
+            width, height = unwrapped.cfg.viewer.resolution
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        # Isaac Lab returns zeros instead of raising when the annotator has no
+        # data, which is how a whole run of black videos goes unnoticed. Say it
+        # once.
+        if frame is not None and not unwrapped._black_frame_warned and not np.any(frame):
+            unwrapped._black_frame_warned = True
+            print("[WARN] Captured an all-black frame — the rgb annotator is not producing pixels.")
+        return frame
+
+    unwrapped.render = render
+    unwrapped._render_is_robust = True
+
+
+def upload_videos_to_wandb(env, video_folder: str):
+    """Make every clip ``gym.wrappers.RecordVideo`` writes show up in W&B.
+
+    W&B's own ``monitor_gym`` hook patches the recorder at ``wandb.init`` time,
+    which is too late here: skrl only starts the run when the agent is built,
+    long after the wrapper exists. So we hook ``stop_recording`` instead and log
+    whatever new ``.mp4`` landed in ``video_folder``. Best-effort — a failed
+    upload must never kill a training run.
+    """
+    import glob
+
+    uploaded: set[str] = set()
+    original_stop = env.stop_recording
+
+    def stop_recording():
+        original_stop()
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+            for path in sorted(glob.glob(os.path.join(video_folder, "*.mp4"))):
+                if path in uploaded or os.path.getsize(path) == 0:
+                    continue
+                uploaded.add(path)
+                # Same step axis as install_wandb_scalar_hook's scalars: W&B
+                # requires monotonically increasing steps across ALL log calls,
+                # and a video logged on its own counter would fight the charts.
+                wandb.log({"video": wandb.Video(path, format="mp4")},
+                          step=int(getattr(env, "step_id", 0)))
+        except Exception:  # noqa: BLE001 — logging must never fail training
+            pass
+
+    env.stop_recording = stop_recording
+    return env
 
 
 def finish_wandb(args_cli) -> None:

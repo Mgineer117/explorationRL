@@ -1,6 +1,7 @@
 # skrl IRPO configuration for PointMaze.
-# IRPO = PPO + an aggregated multi-option intrinsic exploration gradient driven
-# by an online-learned ALLO Laplacian representation
+# IRPO = a base policy optimised by TRPO along an aggregated *surrogate* gradient
+# built from several intrinsic-reward-driven MAML-style adaptations of that base
+# policy, over an ALLO Laplacian representation learned offline and then frozen
 # (see explorationRL/agents/skrl/irpo.py).
 seed: 42
 
@@ -62,22 +63,37 @@ agent:
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: true
   # ── IRPO ──────────────────────────────────────────────────────────────────
-  # Envs are split into num_options + 1 groups: group 0 = base policy,
-  # groups 1..N = persistent exploratory option policies.
+  # For each option: clone the base policy, take num_exp_updates inner steps
+  # (intrinsic advantage, then extrinsic on the last), and fold the result into a
+  # surrogate gradient of the extrinsic objective. Aggregate across options and
+  # apply to the base policy by TRPO.
   num_options: 4
-  option_learning_rate: 0.0003
-  option_epochs: 4
-  option_ratio_clip: 0.2
-  intrinsic_discount: 0.99
+  num_exp_updates: 2
+  inner_learning_rate: 0.01
+  entropy_scaler: 0.0
+  critic_learning_rate: 0.001
+  critic_epochs: 5
+  meta_batch_size: 4096          # transitions for the 2nd-order adaptation + TRPO KL
+  perf_gain_beta: 0.9
+  aggregation_method: softmax     # softmax | argmax | uniform
+  aggregation_temperature: 1.0
+  base_target_kl: 0.01            # TRPO trust region for the base policy
+  trpo_damping: 0.1
+  trpo_cg_iters: 10
+  trpo_backtrack_iters: 10
+  trpo_backtrack_coeff: 0.7
   intrinsic_reward_type: allo     # allo | random (frozen-encoder ablation)
-  # ALLO representation learner
+  # ALLO representation learner (trained offline on a uniform buffer, then frozen)
   extractor_feature_dim: 8
   extractor_hidden_dim: [256, 256]
   extractor_learning_rate: 0.001
   extractor_batch_size: 512
   extractor_discount: 0.9
-  extractor_updates_per_rollout: 1
   extractor_positional_indices: [0, 1]   # PointMaze xy
+  extractor_pretrain_epochs: 5000
+  extractor_collect_steps: 256
+  extractor_uniform_reset: true
+  extractor_cache_dir: model
   experiment:
     directory: pointmaze
     experiment_name: ""

@@ -11,6 +11,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pointmaze_env_cfg:PointMazeEnvCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_aga_cfg_entry_point": f"{agents.__name__}:skrl_aga_cfg.yaml",
         "skrl_ppo_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         "skrl_sac_cfg_entry_point": f"{agents.__name__}:skrl_sac_cfg.yaml",
         "skrl_trpo_cfg_entry_point": f"{agents.__name__}:skrl_trpo_cfg.yaml",

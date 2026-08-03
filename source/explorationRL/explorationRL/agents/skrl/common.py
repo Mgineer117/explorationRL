@@ -71,3 +71,89 @@ def policy_gaussian_kl(policy_p, policy_q, observations: torch.Tensor) -> torch.
             out_p["mean_actions"], out_p["log_std"],
             out_q["mean_actions"], out_q["log_std"],
         )
+
+
+def estimate_advantages(rewards: torch.Tensor, terminated: torch.Tensor,
+                        truncated: torch.Tensor, values: torch.Tensor,
+                        gamma: float, gae: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """GAE(lambda) advantages **and** value targets for a ``(T, num_envs)`` rollout.
+
+    Port of ``utils/rl.py``'s ``estimate_advantages``. Terminations and time-limit
+    truncations are handled separately, as the original does: the value bootstraps
+    across a *truncation* (the episode was cut by the clock, its value still
+    matters) but not across a true *termination*, while the GAE chain is severed at
+    either kind of boundary. Returns ``(advantages, returns)`` — the returns are the
+    critic's regression targets, so this is used to fit the per-option critics.
+    """
+    T = rewards.shape[0]
+    deltas = torch.zeros_like(rewards)
+    advantages = torch.zeros_like(rewards)
+    dones = (terminated.bool() | truncated.bool()).float()
+    term = terminated.float()
+
+    prev_value = torch.zeros(rewards.shape[1], device=rewards.device)
+    prev_adv = torch.zeros(rewards.shape[1], device=rewards.device)
+    for t in reversed(range(T)):
+        bootstrap = 1.0 - term[t]           # value survives a truncation
+        chain = 1.0 - dones[t]              # advantage chain severed at any boundary
+        deltas[t] = rewards[t] + gamma * prev_value * bootstrap - values[t]
+        advantages[t] = deltas[t] + gamma * gae * prev_adv * chain
+        prev_value = values[t]
+        prev_adv = advantages[t]
+    returns = values + advantages
+    return advantages, returns
+
+
+def compute_policy_kl(old_actor, actor, observations: torch.Tensor) -> torch.Tensor:
+    """Differentiable ``KL(old_actor || actor)`` on ``observations``.
+
+    ``old_actor``'s statistics are detached, so the result differentiates only
+    through ``actor`` — exactly what the TRPO Hessian-vector product needs.
+    """
+    with torch.no_grad():
+        _, out_old = old_actor.act({"observations": observations}, role="policy")
+    _, out_new = actor.act({"observations": observations}, role="policy")
+    return gaussian_kl(out_old["mean_actions"].detach(), out_old["log_std"].detach(),
+                       out_new["mean_actions"], out_new["log_std"])
+
+
+def hessian_vector_product(kl_fn, model: nn.Module, damping: float,
+                           v: torch.Tensor) -> torch.Tensor:
+    """``(H + damping*I) v`` where ``H`` is the Hessian of ``kl_fn`` w.r.t. ``model``.
+
+    Port of ``utils/rl.py``'s ``hessian_vector_product`` (Fisher-vector product for
+    TRPO). ``allow_unused`` guards against parameters the KL has no path to.
+    """
+    kl = kl_fn()
+    grads = torch.autograd.grad(kl, list(model.parameters()), create_graph=True,
+                                allow_unused=True)
+    grads = tuple(g if g is not None else torch.zeros_like(p)
+                  for p, g in zip(model.parameters(), grads))
+    flat_grads = torch.cat([g.view(-1) for g in grads])
+    gv = (flat_grads * v).sum()
+    hv = torch.autograd.grad(gv, list(model.parameters()), allow_unused=True)
+    hv = tuple(h if h is not None else torch.zeros_like(p)
+               for p, h in zip(model.parameters(), hv))
+    flat_hv = torch.cat([h.contiguous().view(-1) for h in hv])
+    return flat_hv + damping * v
+
+
+def conjugate_gradients(Av_func, b: torch.Tensor, nsteps: int = 10,
+                        tol: float = 1e-10) -> torch.Tensor:
+    """Solve ``A x = b`` for ``x`` with conjugate gradients (``A`` via ``Av_func``)."""
+    x = torch.zeros_like(b)
+    r = b.clone()
+    p = b.clone()
+    rdotr = torch.dot(r, r)
+    for _ in range(nsteps):
+        Avp = Av_func(p)
+        alpha = rdotr / (torch.dot(p, Avp) + 1e-8)
+        x += alpha * p
+        r -= alpha * Avp
+        new_rdotr = torch.dot(r, r)
+        if new_rdotr < tol:
+            break
+        beta = new_rdotr / (rdotr + 1e-8)
+        p = r + beta * p
+        rdotr = new_rdotr
+    return x

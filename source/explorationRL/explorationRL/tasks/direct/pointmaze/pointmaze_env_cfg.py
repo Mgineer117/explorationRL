@@ -34,6 +34,11 @@ from isaaclab.utils import configclass
 
 # ── PointMaze-v1 layout (identical to POINTMAZE_MAPS["pointmaze-v1"]) ──────── #
 # 1 = wall, 0 = free, "r" = agent reset cell, "g" = goal cell.
+# POINTMAZE_V1_MAP = [
+#     [1, 1, 1, 1, 1, 1],
+#     [1, "r", 1, 0, 0, 1],
+#     [1, 1, 1, 1, 1, 1],
+# ]
 POINTMAZE_V1_MAP = [
     [1, 1, 1, 1, 1, 1],
     [1, "r", 1, "g", 0, 1],
@@ -118,3 +123,7 @@ class PointMazeEnvCfg(DirectRLEnvCfg):
     goal_threshold = GOAL_THRESHOLD
     reset_noise = RESET_NOISE
     reward_type = "sparse"  # "sparse" | "dense" (matches MazeEnv.compute_reward)
+    # Start each episode at a uniformly-random free cell instead of the fixed "r"
+    # cell. Off for the RL task; IRPO.pretrain_extractor flips it on transiently to
+    # collect a near-uniform-coverage buffer for the ALLO representation learner.
+    uniform_reset = False

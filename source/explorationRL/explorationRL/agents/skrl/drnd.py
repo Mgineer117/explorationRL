@@ -31,10 +31,11 @@ import dataclasses
 
 import gymnasium
 import torch
-import torch.nn as nn
 
 from skrl.agents.torch.ppo import PPO
 from skrl.agents.torch.ppo.ppo_cfg import PPO_CFG
+
+from explorationRL.agents.skrl.intrinsic import DRNDNovelty
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -72,16 +73,6 @@ class DRND_CFG(PPO_CFG):
     """Adam learning rate for the predictor network."""
 
 
-def _mlp(in_dim: int, hidden: list[int], out_dim: int, activation) -> nn.Sequential:
-    layers: list[nn.Module] = []
-    d = in_dim
-    for h in hidden:
-        layers += [nn.Linear(d, int(h)), activation()]
-        d = int(h)
-    layers.append(nn.Linear(d, out_dim))
-    return nn.Sequential(*layers)
-
-
 class DRND(PPO):
     """PPO driven by an environment reward augmented with a DRND novelty bonus."""
 
@@ -94,24 +85,20 @@ class DRND(PPO):
         c: DRND_CFG = self.cfg
         obs_dim = int(gymnasium.spaces.flatdim(observation_space))
 
-        self._predictor = _mlp(obs_dim, list(c.predictor_hidden), c.embedding_dim, nn.ReLU).to(self.device)
-        self._targets = nn.ModuleList(
-            [_mlp(obs_dim, list(c.target_hidden), c.embedding_dim, nn.Tanh) for _ in range(int(c.num_targets))]
-        ).to(self.device)
-        for p in self._targets.parameters():
-            p.requires_grad_(False)
-
-        self._predictor_optimizer = torch.optim.Adam(
-            self._predictor.parameters(), lr=c.predictor_learning_rate
+        self._novelty = DRNDNovelty(
+            obs_dim,
+            num_targets=int(c.num_targets),
+            embedding_dim=int(c.embedding_dim),
+            predictor_hidden=list(c.predictor_hidden),
+            target_hidden=list(c.target_hidden),
+            alpha=c.alpha,
+            update_proportion=c.update_proportion,
+            learning_rate=c.predictor_learning_rate,
+            device=self.device,
         )
-        # Persist the predictor (and its optimizer) with the agent checkpoint;
-        # the targets are frozen random features and are reproduced from the seed.
-        self.checkpoint_modules["predictor"] = self._predictor
-
-        # Running variance of the raw novelty, used to normalize the bonus.
-        self._int_mean = torch.zeros(1, device=self.device)
-        self._int_var = torch.ones(1, device=self.device)
-        self._int_count = 1e-4
+        # Persist the predictor with the agent checkpoint; the targets are frozen
+        # random features and are reproduced from the seed.
+        self.checkpoint_modules["predictor"] = self._novelty.predictor
 
         # next_observations seen during the current rollout, consumed by update().
         self._rollout_next_obs: list[torch.Tensor] = []
@@ -124,53 +111,9 @@ class DRND(PPO):
         except Exception:  # noqa: BLE001 — preprocessor is optional
             return obs
 
-    def _update_int_stats(self, x: torch.Tensor) -> None:
-        """Welford batch update of the novelty's running mean/variance."""
-        batch_mean = x.mean()
-        batch_var = x.var(unbiased=False)
-        batch_count = x.numel()
-        delta = batch_mean - self._int_mean
-        total = self._int_count + batch_count
-        new_mean = self._int_mean + delta * batch_count / total
-        m_a = self._int_var * self._int_count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta**2 * self._int_count * batch_count / total
-        self._int_mean = new_mean
-        self._int_var = m2 / total
-        self._int_count = total
-
     @torch.no_grad()
     def _intrinsic_reward(self, next_observations: torch.Tensor) -> torch.Tensor:
-        obs = self._preprocess(next_observations)
-        pred = self._predictor(obs)
-        targets = torch.stack([t(obs) for t in self._targets], dim=0)
-
-        mu = targets.mean(dim=0)
-        b2_mom = (targets**2).mean(dim=0)
-
-        b1 = self.cfg.alpha * ((pred - mu) ** 2).sum(dim=1, keepdim=True)
-        var = torch.clamp(b2_mom - mu**2, min=1e-6)
-        b2 = (1.0 - self.cfg.alpha) * torch.sqrt(
-            torch.clamp(torch.abs(pred**2 - mu**2) / var, 1e-6, 1.0)
-        ).sum(dim=-1, keepdim=True)
-
-        novelty = b1 + b2
-        self._update_int_stats(novelty)
-        return novelty / (self._int_var.sqrt() + 1e-8)
-
-    def _drnd_loss(self, next_observations: torch.Tensor) -> torch.Tensor:
-        obs = self._preprocess(next_observations)
-        pred = self._predictor(obs)
-        n = obs.shape[0]
-        with torch.no_grad():
-            targets = torch.stack([t(obs) for t in self._targets], dim=0)
-            idx = torch.randint(high=int(self.cfg.num_targets), size=(n,), device=obs.device)
-            target = targets[idx, torch.arange(n, device=obs.device), :]
-        per_sample = ((pred - target) ** 2).mean(dim=-1)
-        # Only a random update_proportion of the batch trains the predictor.
-        mask = (torch.rand(n, device=obs.device) < self.cfg.update_proportion).float()
-        loss = (per_sample * mask).sum() / torch.clamp(mask.sum(), min=1.0)
-        return self.cfg.drnd_loss_scale * loss
+        return self._novelty(self._preprocess(next_observations))
 
     # ── skrl hooks ────────────────────────────────────────────────────────── #
     def record_transition(self, *, observations, states, actions, rewards, next_observations,
@@ -194,11 +137,11 @@ class DRND(PPO):
         # Distil the predictor on this rollout's observations before PPO's update,
         # so the bonus for the next rollout reflects what has now been visited.
         if self._rollout_next_obs:
-            obs = torch.cat(self._rollout_next_obs, dim=0)
+            obs = self._preprocess(torch.cat(self._rollout_next_obs, dim=0))
             self._rollout_next_obs.clear()
-            loss = self._drnd_loss(obs)
-            self._predictor_optimizer.zero_grad()
+            loss = self.cfg.drnd_loss_scale * self._novelty.loss(obs)
+            self._novelty.optimizer.zero_grad()
             loss.backward()
-            self._predictor_optimizer.step()
+            self._novelty.optimizer.step()
             self.track_data("DRND / Predictor loss", loss.item())
         super().update(timestep=timestep, timesteps=timesteps)

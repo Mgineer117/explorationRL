@@ -32,12 +32,16 @@ from .pointmaze_env_cfg import PointMazeEnvCfg
 
 
 def _maze_geometry(maze_map, cell_size):
-    """Return (wall_centers, reset_cell_xy, goal_cell_xy) in local maze coords.
+    """Return (wall_centers, reset_cell_xy, goal_cell_xy, free_cells) in local coords.
 
     Uses the exact cell→(x,y) mapping of gymnasium-robotics ``Maze``:
         x = (j + 0.5) * scaling - x_map_center
         y = y_map_center - (i + 0.5) * scaling
     with x_map_center = cols/2 * scaling, y_map_center = rows/2 * scaling.
+
+    ``free_cells`` is every non-wall cell centre (including "r"/"g"); it is the
+    support of the uniform reset used to collect ALLO's representation-learning
+    data (see ``PointMazeEnv._reset_idx``).
     """
     rows = len(maze_map)
     cols = len(maze_map[0])
@@ -45,6 +49,7 @@ def _maze_geometry(maze_map, cell_size):
     y_map_center = rows / 2.0 * cell_size
 
     walls: list[tuple[float, float]] = []
+    free_cells: list[tuple[float, float]] = []
     reset_xy: tuple[float, float] | None = None
     goal_xy: tuple[float, float] | None = None
     for i in range(rows):
@@ -54,13 +59,15 @@ def _maze_geometry(maze_map, cell_size):
             y = y_map_center - (i + 0.5) * cell_size
             if val == 1:
                 walls.append((x, y))
-            elif val == "r":
+                continue
+            free_cells.append((x, y))
+            if val == "r":
                 reset_xy = (x, y)
             elif val == "g":
                 goal_xy = (x, y)
     if reset_xy is None or goal_xy is None:
         raise ValueError("PointMaze map must contain exactly one 'r' and one 'g' cell.")
-    return walls, reset_xy, goal_xy
+    return walls, reset_xy, goal_xy, free_cells
 
 
 class PointMazeEnv(DirectRLEnv):
@@ -70,10 +77,19 @@ class PointMazeEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         # Maze geometry (local coordinates, shared across envs).
-        walls, reset_xy, goal_xy = _maze_geometry(cfg.maze_map, cfg.cell_size)
+        walls, reset_xy, goal_xy, free_cells = _maze_geometry(cfg.maze_map, cfg.cell_size)
         self._reset_xy = torch.tensor(reset_xy, device=self.device, dtype=torch.float32)
         self._goal_cell_xy = torch.tensor(goal_xy, device=self.device, dtype=torch.float32)
+        self._free_cells = torch.tensor(free_cells, device=self.device, dtype=torch.float32)
         self._z0 = float(cfg.maze_height / 2.0)
+
+        # When True, ``_reset_idx`` starts each env at a uniformly-random free cell
+        # instead of the fixed "r" cell. This is toggled on *only* while collecting
+        # the representation-learning buffer for ALLO (IRPO.pretrain_extractor), so
+        # that extractor sees a near-uniform state distribution — the measure its
+        # orthonormality constraint assumes — while the RL task keeps its fixed
+        # start. See getattr default so old checkpoints/configs stay valid.
+        self._uniform_reset = bool(getattr(cfg, "uniform_reset", False))
 
         # Per-env goal (local coords), sampled every reset.
         self.goal = self._goal_cell_xy.unsqueeze(0).repeat(self.num_envs, 1).clone()
@@ -102,7 +118,7 @@ class PointMazeEnv(DirectRLEnv):
 
         # Maze walls: static colliders spawned under the env-0 template, then
         # cloned to every env by clone_environments below.
-        walls, _, _ = _maze_geometry(self.cfg.maze_map, self.cfg.cell_size)
+        walls, _, _, _ = _maze_geometry(self.cfg.maze_map, self.cfg.cell_size)
         wall_cfg = sim_utils.CuboidCfg(
             size=(self.cfg.cell_size, self.cfg.cell_size, self.cfg.maze_height),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -148,7 +164,7 @@ class PointMazeEnv(DirectRLEnv):
         forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
         forces[:, 0, 0:2] = force_xy
         torques = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self.point.set_external_force_and_torque(forces, torques)
+        self.point.permanent_wrench_composer.set_forces_and_torques(forces=forces, torques=torques)
 
     # ── observation / reward / done ───────────────────────────────────────── #
     def _pos_xy(self) -> torch.Tensor:
@@ -185,7 +201,13 @@ class PointMazeEnv(DirectRLEnv):
         n = len(env_ids)
         noise = lambda: (torch.rand(n, 2, device=self.device) * 2.0 - 1.0) * self._reset_noise
 
-        start_xy = self._reset_xy.unsqueeze(0) + noise()
+        if self._uniform_reset:
+            # Uniform over free cells — used for ALLO data collection only.
+            cell_idx = torch.randint(self._free_cells.shape[0], (n,), device=self.device)
+            start_cell = self._free_cells[cell_idx]
+        else:
+            start_cell = self._reset_xy.unsqueeze(0)
+        start_xy = start_cell + noise()
         self.goal[env_ids] = self._goal_cell_xy.unsqueeze(0) + noise()
 
         # World pose: env origin + local start, identity orientation, z = z0.

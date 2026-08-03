@@ -2,7 +2,7 @@
 
 The PPO / TRPO / SAC baselines are resolved entirely by stock skrl. This subclass
 adds two things so the ported research algorithms (DRND, PSNE, HTRPO, IRPO, HRL,
-MAML) can be selected from a yaml exactly like a built-in:
+MAML, AGA) can be selected from a yaml exactly like a built-in:
 
 1. ``_COMPONENT_REGISTRY`` — a ``name -> factory`` table consulted before skrl's
    own ``_component`` lookup. Each algorithm registers its agent class under
@@ -64,6 +64,18 @@ def _irpo_cfg():
     return IRPO_CFG
 
 
+def _aga_agent():
+    from explorationRL.agents.skrl.aga import AGA
+
+    return AGA
+
+
+def _aga_cfg():
+    from explorationRL.agents.skrl.aga import AGA_CFG
+
+    return AGA_CFG
+
+
 def _hrl_agent():
     from explorationRL.agents.skrl.hrl import HRL
 
@@ -112,6 +124,8 @@ class ExplorationRunner(Runner):
         "htrpo_cfg": _htrpo_cfg,
         "irpo": _irpo_agent,
         "irpo_cfg": _irpo_cfg,
+        "aga": _aga_agent,
+        "aga_cfg": _aga_cfg,
         "hrl": _hrl_agent,
         "hrl_cfg": _hrl_cfg,
         "maml": _maml_agent,

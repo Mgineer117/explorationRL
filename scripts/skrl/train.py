@@ -51,6 +51,18 @@ parser.add_argument("--skip_final_eval", "--skip-final-eval", action="store_true
                     help="Skip the post-training evaluation rollout (sweeps read the trainer scalars).")
 parser.add_argument("--agent", type=str, default=None, help="Explicit skrl cfg entry-point key override.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
+parser.add_argument("--int_reward", "--int-reward", type=str, default=None,
+                    choices=["drnd", "allo", "best"],
+                    help="Wrap the env with an intrinsic reward model; it is exposed per step "
+                         "as infos['int_reward'] (default: none).")
+parser.add_argument("--int_reward_option", "--int-reward-option", type=int, default=0,
+                    help="Which ALLO eigenvector direction to use (--int_reward allo only).")
+parser.add_argument("--int_reward_num_options", "--int-reward-num-options", type=int, default=2,
+                    help="Number of ALLO directions the extractor provides.")
+parser.add_argument("--record_visitation", "--record-visitation", action="store_true", default=False,
+                    help="Record one occupancy histogram per policy update to "
+                         "<log_dir>/visitation.npz (animate it with scripts/skrl/visitation.py --animate).")
+parser.add_argument("--visitation_bins_per_cell", type=int, default=10)
 parser.add_argument("--distributed", action="store_true", default=False)
 
 # Common agent-config overrides (flag name == YAML key under `agent:`).
@@ -93,6 +105,14 @@ if args_cli.video:
 # hydra needs a clean argv (strip our dotted/`=` passthrough) before launching.
 args_cli.kit_args = (getattr(args_cli, "kit_args", "") or "") + " --/app/hangDetector/enabled=false"
 hydra_args = [a for a in hydra_args if not (a.startswith("--") and ("=" in a or "." in a))]
+
+# `agent.<key>=<value>` overrides are applied by _apply_agent_overrides below, not
+# by hydra: the agent node hydra composes for this task is not the yaml's, so it
+# rejects *every* agent key ("Key '<key>' is not in struct") — including plain
+# ones like agent.discount_factor. This is the same dotted dialect the W&B sweeps
+# use (search/configs/*.yaml). `env.<key>=<value>` still goes to hydra as usual.
+agent_overrides = [a for a in hydra_args if a.startswith("agent.") and "=" in a]
+hydra_args = [a for a in hydra_args if a not in agent_overrides]
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -110,12 +130,14 @@ from datetime import datetime  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
 import skrl  # noqa: E402
+import yaml  # noqa: E402
 from packaging import version  # noqa: E402
 
 sys.path.append(os.path.dirname(__file__))
 from train_utils import (  # noqa: E402
-    apply_wandb_sweep_overrides, default_num_envs, finish_wandb,
-    install_wandb_scalar_hook, is_sweep, write_seed_result,
+    _set_dotted, apply_wandb_sweep_overrides, default_num_envs, finish_wandb,
+    install_wandb_scalar_hook, is_sweep, upload_videos_to_wandb, warmup_video_pipeline,
+    write_seed_result,
 )
 
 SKRL_VERSION = "2.1.0"
@@ -132,6 +154,7 @@ import isaaclab_tasks  # noqa: F401,E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import explorationRL.tasks  # noqa: F401,E402 — registers PointMaze-v1 etc.
+from explorationRL.agents.skrl.intrinsic import wrap_intrinsic  # noqa: E402
 from explorationRL.agents.skrl.runner import ExplorationRunner  # noqa: E402
 
 algorithm = args_cli.algorithm.lower()
@@ -145,6 +168,17 @@ def _apply_agent_overrides(agent_cfg: dict) -> None:
         val = getattr(args_cli, key, None)
         if val is not None:
             a[key] = val
+    for override in agent_overrides:
+        path, _, value = override.partition("=")
+        *parents, leaf = path.split(".")[1:]  # drop the leading "agent"
+        node = a
+        for p in parents:
+            node = node[p]
+        if leaf not in node:
+            raise KeyError(f"'{path}' is not a key of {agent_cfg_entry_point}")
+        # yaml.safe_load: "0.98" -> float, "true" -> bool, "[1, 2]" -> list.
+        _set_dotted(a, ".".join(parents + [leaf]), yaml.safe_load(value))
+        print(f"[INFO] Agent config override: {path} = {node[leaf]!r}")
 
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
@@ -202,7 +236,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
         install_wandb_scalar_hook()
     else:
         experiment["wandb"] = True
-        wkw["sync_tensorboard"] = True
+        # NOT sync_tensorboard: it only patches torch's SummaryWriter, which skrl
+        # 2.x no longer uses, so it syncs nothing while still seizing the step
+        # axis ("Step cannot be set when using tensorboard syncing" — which then
+        # drops the step on our own scalar/video logs). install_wandb_scalar_hook
+        # forwards skrl's scalars directly instead.
+        wkw["sync_tensorboard"] = False
         install_wandb_scalar_hook()
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
@@ -211,15 +250,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
     # ── env ───────────────────────────────────────────────────────────────── #
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     if args_cli.video:
+        # Isaac Lab builds the rgb annotator lazily inside the first render().
+        # Doing that on training step 0 — before the RTX renderer has produced a
+        # single frame — makes omni.syntheticdata activate its SDG graph against
+        # empty buffers and die with "Unable to write from unknown dtype, kind=f,
+        # size=0". Pump a few renders and build the annotator here instead, while
+        # nothing is consuming its output yet.
+        warmup_video_pipeline(env)
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            # Skip step 0: the trainer's very first step is also the noisiest
+            # moment for the renderer, and the warm-up above already covers it.
+            "step_trigger": lambda step: step > 0 and step % args_cli.video_interval == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
         }
         print("[INFO] Recording training videos.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        if not args_cli.no_wandb:
+            env = upload_videos_to_wandb(env, video_kwargs["video_folder"])
 
     # Episode length is read BEFORE the skrl wrapper (which does not forward it)
     # and drives the one-episode final eval below.
@@ -227,12 +277,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
     num_envs = int(env_cfg.scene.num_envs)
 
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+    env = wrap_intrinsic(env, args_cli.int_reward, option=args_cli.int_reward_option,
+                         num_options=args_cli.int_reward_num_options)
+
+    if args_cli.record_visitation:
+        # One frame per policy update: the trainer collects `rollouts` steps, then
+        # updates, so that is the natural frame boundary.
+        from explorationRL.agents.skrl.wrappers import VisitationRecorder
+        from explorationRL.tasks.direct.pointmaze.pointmaze_env_cfg import CELL_SIZE, POINTMAZE_V1_MAP
+
+        rows, cols = len(POINTMAZE_V1_MAP), len(POINTMAZE_V1_MAP[0])
+        x_max, y_max = cols / 2.0 * CELL_SIZE, rows / 2.0 * CELL_SIZE
+        b = int(args_cli.visitation_bins_per_cell)
+        env = VisitationRecorder(
+            env, path=os.path.join(log_dir, "visitation.npz"),
+            extent=(-x_max, x_max, -y_max, y_max), bins=(rows * b, cols * b),
+            steps_per_update=int(agent_cfg["agent"]["rollouts"]),
+            maze_map=POINTMAZE_V1_MAP,
+        )
+        print(f"[INFO] Recording visitation every {agent_cfg['agent']['rollouts']} steps.")
 
     # ── train ─────────────────────────────────────────────────────────────── #
     runner = ExplorationRunner(env, agent_cfg)
     if args_cli.checkpoint:
         print(f"[INFO] Loading checkpoint: {args_cli.checkpoint}")
         runner.agent.load(args_cli.checkpoint)
+
+    # Agents with an offline representation-learning phase (IRPO's ALLO) pretrain
+    # it here, before the trainer takes over the env loop. No-op for other agents.
+    if hasattr(runner.agent, "pretrain_extractor") and not args_cli.checkpoint:
+        runner.agent.pretrain_extractor(env, tag=f"{args_cli.task}_seed{seed}")
 
     start = time.time()
     runner.run()

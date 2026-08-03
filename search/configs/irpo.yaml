@@ -8,23 +8,25 @@ metric:
   goal: maximize
 
 parameters:
-  # PPO backbone
+  # GAE / return shaping (used by the per-option critics)
   agent.discount_factor:
     values: [0.98, 0.99, 0.995]
   agent.gae_lambda:
     values: [0.9, 0.95, 0.97]
-  agent.learning_rate:
-    values: [0.0001, 0.0003, 0.001]
-  # IRPO exploration
+  # IRPO exploration + surrogate-gradient adaptation
   agent.num_options:
     values: [2, 4, 8]
-  agent.option_learning_rate:
-    values: [0.0001, 0.0003, 0.001]
-  agent.option_epochs:
-    values: [2, 4, 8]
+  agent.num_exp_updates:
+    values: [2, 3, 5]
+  agent.inner_learning_rate:
+    values: [0.003, 0.01, 0.03]
+  agent.aggregation_method:
+    values: [softmax, argmax, uniform]
+  agent.base_target_kl:
+    values: [0.005, 0.01, 0.02]
   agent.intrinsic_reward_type:
     values: [allo, random]
-  # representation
+  # representation (learned offline, then frozen)
   agent.extractor_learning_rate:
     values: [0.0003, 0.001, 0.003]
   agent.extractor_discount:
