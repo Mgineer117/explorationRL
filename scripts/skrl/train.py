@@ -52,13 +52,37 @@ parser.add_argument("--skip_final_eval", "--skip-final-eval", action="store_true
 parser.add_argument("--agent", type=str, default=None, help="Explicit skrl cfg entry-point key override.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
 parser.add_argument("--int_reward", "--int-reward", type=str, default=None,
-                    choices=["drnd", "allo", "best"],
+                    choices=["drnd", "allo", "allo_kernel", "best"],
                     help="Wrap the env with an intrinsic reward model; it is exposed per step "
                          "as infos['int_reward'] (default: none).")
 parser.add_argument("--int_reward_option", "--int-reward-option", type=int, default=0,
                     help="Which ALLO eigenvector direction to use (--int_reward allo only).")
 parser.add_argument("--int_reward_num_options", "--int-reward-num-options", type=int, default=2,
                     help="Number of ALLO directions the extractor provides.")
+parser.add_argument("--allo_pretrained", "--allo-pretrained", type=str, default=None,
+                    help="Path to a frozen ALLO checkpoint (scripts/skrl/pretrain_allo.py) to load for "
+                         "--int_reward allo|allo_kernel, instead of training it online from scratch. Its "
+                         "architecture (--allo_feature_dim / --allo_positional_indices) must match how it "
+                         "was pretrained.")
+parser.add_argument("--allo_feature_dim", "--allo-feature-dim", type=int, default=None,
+                    help="ALLO embedding width (default: num_options // 2 + 2, min 8).")
+parser.add_argument("--allo_positional_indices", "--allo-positional-indices", type=int, nargs="+", default=None,
+                    help="Observation slice ALLO reads (e.g. 0 1 for xy). Default: whole observation.")
+parser.add_argument("--goal_indices", "--goal-indices", type=int, nargs="+", default=None,
+                    help="Observation dims holding the goal (--int_reward allo_kernel only; e.g. 6 7 for "
+                         "PointMaze's [x,y,vx,vy,achieved_x,achieved_y,goal_x,goal_y]). Must have the same "
+                         "length as --allo_positional_indices.")
+parser.add_argument("--kernel_mode", "--kernel-mode", type=str, default="cosine",
+                    choices=["rbf", "laplacian", "cauchy", "cosine"],
+                    help="Similarity kernel combining ALLO's directions into one goal-conditioned "
+                         "reward (--int_reward allo_kernel only).")
+parser.add_argument("--kernel_num_dims", "--kernel-num-dims", type=int, default=None,
+                    help="How many ALLO output dims (after dropping index 0) feed the kernel "
+                         "(--int_reward allo_kernel only; default: all of them).")
+parser.add_argument("--int_reward_coef", "--int-reward-coef", type=float, default=0.0,
+                    help="Add int_reward_coef * int_reward directly onto the reward a PLAIN agent "
+                         "(e.g. ppo) sees. Default 0 leaves reward untouched -- AGA doesn't need this, "
+                         "it reads infos['int_reward'] itself via agent.target_dist=intrinsic.")
 parser.add_argument("--record_visitation", "--record-visitation", action="store_true", default=False,
                     help="Record one occupancy histogram per policy update to "
                          "<log_dir>/visitation.npz (animate it with scripts/skrl/visitation.py --animate).")
@@ -277,8 +301,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
     num_envs = int(env_cfg.scene.num_envs)
 
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+    allo_cfg = None
+    if args_cli.allo_feature_dim is not None or args_cli.allo_positional_indices is not None:
+        from explorationRL.extractors import ALLO_CFG
+
+        allo_cfg = ALLO_CFG()
+        if args_cli.allo_feature_dim is not None:
+            allo_cfg.feature_dim = args_cli.allo_feature_dim
+        if args_cli.allo_positional_indices is not None:
+            allo_cfg.positional_indices = list(args_cli.allo_positional_indices)
+
     env = wrap_intrinsic(env, args_cli.int_reward, option=args_cli.int_reward_option,
-                         num_options=args_cli.int_reward_num_options)
+                         num_options=args_cli.int_reward_num_options,
+                         allo_cfg=allo_cfg, allo_pretrained_path=args_cli.allo_pretrained,
+                         discount=float(agent_cfg["agent"].get("discount_factor", 0.99)),
+                         goal_indices=args_cli.goal_indices, kernel_mode=args_cli.kernel_mode,
+                         kernel_num_dims=args_cli.kernel_num_dims, reward_scale=args_cli.int_reward_coef,
+                         log_dir=log_dir)
 
     if args_cli.record_visitation:
         # One frame per policy update: the trainer collects `rollouts` steps, then

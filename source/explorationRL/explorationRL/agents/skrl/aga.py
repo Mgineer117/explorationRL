@@ -26,7 +26,7 @@ import torch
 from skrl.agents.torch.ppo import PPO
 from skrl.agents.torch.ppo.ppo_cfg import PPO_CFG
 
-from explorationRL.agents.skrl.common import flat_params, set_flat_params
+from explorationRL.agents.skrl.common import flat_params, return_to_go, set_flat_params
 from explorationRL.tasks.direct.pointmaze.pointmaze_env_cfg import CELL_SIZE, POINTMAZE_V1_MAP
 
 
@@ -45,7 +45,42 @@ class AGA_CFG(PPO_CFG):
     alpha_end: float = 0.3
     alpha_anneal_updates: int = 300
     """Linear anneal of the preconditioned step-size multiplier, in units of
-    ``update()`` calls."""
+    ``update()`` calls. ``precond_beta``/``precond_damp`` anneal to 0 on this same
+    schedule (bug fix, not opt-in): otherwise the rank-1 eigenvalue along
+    ``v_hat`` stays 1+beta/1-damp forever, so the exploration kick never fades
+    and PPO can never fine-tune cleanly once the goal is found."""
+
+    precond_tau: float = 0.0
+    """If > 0, replace the hard ``sign(proj)`` branch with a continuous
+    ``tanh(proj / precond_tau)`` interpolation between the ``-damp`` and
+    ``beta`` eigenvalues (still exactly PD for any ``proj``, still an exact
+    fixed point at ``proj=0``). ``0`` keeps the original hard switch, which
+    flips between a 3x and a 10x step from a noise-level sign change in
+    ``proj`` near its zero-crossing — set this to roughly the typical
+    ``|AGA / proj|`` you see logged, to kill that bang-bang variance."""
+
+    v_hat_momentum: float = 0.0
+    """EMA momentum for ``v_hat`` across updates (``0`` = the original
+    single-batch REINFORCE estimate, no smoothing). A single small on-policy
+    batch is a high-variance direction estimate, especially early on when a
+    sparse/binary target reward is rarely hit; try ``0.8``-``0.9`` to smooth
+    it out."""
+
+    entropy_start: float = 0.0
+    entropy_end: float = 0.0
+    entropy_anneal_updates: int = 1000
+    """Linearly anneal ``cfg.entropy_loss_scale`` from ``entropy_start`` to
+    ``entropy_end`` over this many ``update()`` calls (``0``/``0`` = no-op,
+    the original constant ``entropy_loss_scale``). This targets the actual
+    source of AGA's seed-to-seed bimodality: with an all-zero task reward,
+    ``v_hat`` is mathematically exactly zero (return-to-go standardizes a
+    constant to 0), so the preconditioner is the identity until *some* env
+    happens to reach a target cell. Whether that happens at all depends on
+    the base PPO policy not collapsing its action std to ~0 first (a
+    well-documented sparse-reward PPO failure mode, independent of AGA) --
+    once that happens the run is stuck at 0% regardless of preconditioning.
+    A decaying entropy bonus keeps the policy stochastic long enough to find
+    the target, then fades so it can still converge/exploit once found."""
 
     target_dist: str = "bottleneck"
     """Exploration target ``v_hat`` is fit to: ``bottleneck`` | ``uniform`` |
@@ -139,19 +174,6 @@ class _MazeCells:
         return self.cell_to_idx[i, j].clamp(min=0)  # off-map/wall samples fall back to cell 0
 
 
-def _return_to_go(b_t: torch.Tensor, dones: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Discounted return-to-go over a ``(T, N)`` batch, reset at episode ends
-    (``dones[t]`` marks the terminal step of an episode, matching the convention
-    of ``estimate_advantages``/``compute_gae`` in ``common.py``)."""
-    T = b_t.shape[0]
-    G = torch.zeros_like(b_t)
-    running = torch.zeros(b_t.shape[1], device=b_t.device)
-    for t in reversed(range(T)):
-        running = b_t[t] + gamma * running * (~dones[t]).float()
-        G[t] = running
-    return G
-
-
 class AGA(PPO):
     """PPO whose realized update is asymmetrically, PD-preconditioned toward an
     exploration direction, instead of task reward being augmented."""
@@ -167,6 +189,7 @@ class AGA(PPO):
         self.maze = _MazeCells(c.maze_map, c.cell_size, self.device)
         self._visit_counts = torch.ones(self.maze.n_cells, device=self.device)  # Laplace-smoothed
         self._update_count = 0
+        self._v_hat_ema: torch.Tensor | None = None
         # Intrinsic rewards of the current rollout (one (num_envs, 1) entry per
         # step), collected from the env wrapper's infos and consumed by update().
         self._rollout_int_rewards: list[torch.Tensor] = []
@@ -217,7 +240,7 @@ class AGA(PPO):
         else:
             idx = self.maze.cell_index(obs_flat[:, :2]).reshape(T, N)
             b_t = self._cell_target_reward()[idx]
-        G_t = _return_to_go(b_t, dones, c.meta_gamma)
+        G_t = return_to_go(b_t, dones, c.meta_gamma)
         G_t = (G_t - G_t.mean()) / (G_t.std() + 1e-8)
 
         obs_p = self._observation_preprocessor(obs_flat)
@@ -241,7 +264,13 @@ class AGA(PPO):
             (-g if g is not None else torch.zeros_like(p)).reshape(-1)
             for p, g in zip(params, grads)
         ])
-        return v / (v.norm() + 1e-12)
+        v = v / (v.norm() + 1e-12)
+
+        if c.v_hat_momentum > 0.0:
+            self._v_hat_ema = v if self._v_hat_ema is None else (
+                c.v_hat_momentum * self._v_hat_ema + (1.0 - c.v_hat_momentum) * v)
+            v = self._v_hat_ema / (self._v_hat_ema.norm() + 1e-12)
+        return v
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         c: AGA_CFG = self.cfg
@@ -289,6 +318,16 @@ class AGA(PPO):
             shaping = c.discount_factor * next_phi * not_done - phi
             self.memory.get_tensor_by_name("rewards").add_(c.dense_coef * shaping)
 
+        self._update_count += 1
+        progress = min(1.0, self._update_count / max(1, int(c.alpha_anneal_updates)))
+
+        # Decaying entropy bonus, computed BEFORE the PPO inner loop (unlike
+        # the preconditioner knobs below) since it must affect that loop's own
+        # gradient, not just the post-hoc reshaping of its output.
+        if c.entropy_start != 0.0 or c.entropy_end != 0.0:
+            ent_progress = min(1.0, self._update_count / max(1, int(c.entropy_anneal_updates)))
+            c.entropy_loss_scale = c.entropy_start + (c.entropy_end - c.entropy_start) * ent_progress
+
         theta_before = flat_params(self.policy)
         v_hat = self._target_direction(observations, actions, dones)
 
@@ -298,18 +337,26 @@ class AGA(PPO):
         delta_ppo = flat_params(self.policy) - theta_before
         set_flat_params(self.policy, theta_before)
 
-        # 3. Asymmetric rank-1 PD preconditioner.
+        # 3. Asymmetric rank-1 PD preconditioner. beta/damp anneal to 0 on the
+        #    same schedule as alpha, so the eigenvalue along v_hat relaxes to 1
+        #    (pure PPO) instead of amplifying/damping this direction forever.
+        beta_t = c.precond_beta * (1.0 - progress)
+        damp_t = c.precond_damp * (1.0 - progress)
+        alpha_t = c.alpha_start + (c.alpha_end - c.alpha_start) * progress
+
         proj = torch.dot(v_hat, delta_ppo)
-        scale = c.precond_beta if proj.item() > 0 else -c.precond_damp
+        if c.precond_tau > 0.0:
+            t = torch.tanh(proj / c.precond_tau)
+            scale = 0.5 * (beta_t + damp_t) * t + 0.5 * (beta_t - damp_t)
+        else:
+            scale = beta_t if proj.item() > 0 else -damp_t
         g_tilde = delta_ppo + scale * proj * v_hat
 
         # 4. Annealed step onto the preconditioned update.
-        self._update_count += 1
-        progress = min(1.0, self._update_count / max(1, int(c.alpha_anneal_updates)))
-        alpha_t = c.alpha_start + (c.alpha_end - c.alpha_start) * progress
         set_flat_params(self.policy, theta_before + alpha_t * g_tilde)
 
         self.track_data("AGA / proj", float(proj.item()))
         self.track_data("AGA / alpha", float(alpha_t))
         self.track_data("AGA / g_tilde_norm", float(g_tilde.norm().item()))
         self.track_data("AGA / delta_ppo_norm", float(delta_ppo.norm().item()))
+        self.track_data("AGA / entropy_loss_scale", float(c.entropy_loss_scale))

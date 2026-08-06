@@ -261,7 +261,17 @@ def is_sweep() -> bool:
 
 def write_seed_result(skrl_env, agent, *, task: str, algorithm: str, seed: int,
                       max_len: int, num_envs: int) -> None:
-    """Deterministically roll out one episode and write a one-row result CSV.
+    """Roll out one episode with the actual *stochastic* policy and write a
+    one-row result CSV.
+
+    Never overrides the sampled action with the Gaussian mean: the policy
+    gradient theorem is derived for the stochastic policy, so that's the
+    policy actually being optimized and the only one it's valid to evaluate.
+    A policy whose mean hasn't sharpened onto the solution yet but whose
+    samples already reach the goal is an undertrained policy, not one that
+    "doesn't work" -- collapsing to the mean at eval time hides exactly that
+    signal (see ``scripts/skrl/play.py --stochastic`` for the same rollout
+    outside training).
 
     Produces ``results/<EXP_RUN_TAG>/<task>_<algorithm>_seed<seed>.csv`` with the
     mean first-episode return and success rate (an env "succeeds" if it earns any
@@ -271,10 +281,30 @@ def write_seed_result(skrl_env, agent, *, task: str, algorithm: str, seed: int,
     Best-effort and fully guarded: a failure here must never fail a training run
     that already completed. Skipped by ``--skip_final_eval`` (sweeps read the
     trainer scalars instead).
+
+    ``skrl_env`` may have an ``IntrinsicRewardWrapper`` with ``reward_scale != 0``
+    somewhere in its wrapper chain (e.g. under ``VisitationRecorder`` when
+    ``--record_visitation`` is passed) -- an exploration bonus blended into the
+    training reward for a plain agent, see ``agents/skrl/intrinsic.py``.
+    "success" and "return" must stay reads of the true sparse task reward
+    regardless of what the agent trained on, so ``reward_scale`` is forced to 0
+    for this rollout and restored after. Setting ``skrl_env.reward_scale``
+    directly only works if ``skrl_env`` *is* the ``IntrinsicRewardWrapper`` --
+    if it is wrapped further (e.g. by ``VisitationRecorder``), that would just
+    create a same-named shadow attribute on the outer wrapper and silently
+    leave the real one untouched, so the actual owner is found by walking the
+    ``._env`` chain.
     """
     import csv
 
     import torch
+
+    scale_owner = skrl_env
+    while scale_owner is not None and "reward_scale" not in vars(scale_owner):
+        scale_owner = getattr(scale_owner, "_env", None)
+    prev_reward_scale = scale_owner.reward_scale if scale_owner is not None else None
+    if scale_owner is not None:
+        scale_owner.reward_scale = 0.0
 
     try:
         # skrl 2.x: enable_training_mode(False); 1.x used set_running_mode("eval").
@@ -291,9 +321,7 @@ def write_seed_result(skrl_env, agent, *, task: str, algorithm: str, seed: int,
 
         with torch.no_grad():
             for t in range(int(max_len)):
-                actions, outputs = agent.act(observations, states, timestep=t, timesteps=int(max_len))
-                if isinstance(outputs, dict) and outputs.get("mean_actions") is not None:
-                    actions = outputs["mean_actions"]
+                actions, _ = agent.act(observations, states, timestep=t, timesteps=int(max_len))
                 observations, rewards, terminated, truncated, _ = skrl_env.step(actions)
                 states = skrl_env.state()
                 r = rewards.reshape(-1)
@@ -308,6 +336,9 @@ def write_seed_result(skrl_env, agent, *, task: str, algorithm: str, seed: int,
     except Exception as exc:  # noqa: BLE001 — never fail a finished run
         print(f"[train] final eval skipped ({type(exc).__name__}: {exc})")
         return
+    finally:
+        if scale_owner is not None:
+            scale_owner.reward_scale = prev_reward_scale
 
     run_tag = os.environ.get("EXP_RUN_TAG", "adhoc")
     out_dir = os.path.join("results", run_tag)

@@ -1,0 +1,75 @@
+# skrl PGNoCritic configuration for PointMaze.
+# Ablation: same PPO clipped-surrogate multi-epoch update as skrl_ppo_cfg.yaml,
+# but the advantage is a normalized discounted Monte-Carlo return-to-go instead
+# of GAE-with-critic, and models.separate: true so the value network is a
+# genuinely distinct, permanently-untrained network -- no critic-loss gradient
+# ever reaches the policy (see explorationRL/agents/skrl/pg_no_critic.py).
+seed: 42
+
+models:
+  separate: true
+  policy:  # gaussian_model
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ACTIONS
+  value:  # deterministic_model — built but never trained/used, see pg_no_critic.py
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers: [256, 256]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1  # auto (= agent.rollouts)
+
+agent:
+  class: PGNoCritic
+  rollouts: 32
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.99
+  gae_lambda: 0.95        # unused (no GAE) -- kept only for PPO_CFG compatibility
+  learning_rate: 3.0e-04
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.01
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2         # unused (no critic)
+  entropy_loss_scale: 0.0
+  value_loss_scale: 1.0   # unused (no critic)
+  kl_threshold: 0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: true
+  experiment:
+    directory: pointmaze
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+    wandb: true
+    wandb_kwargs:
+      project: explorationRL
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 100000
+  environment_info: log

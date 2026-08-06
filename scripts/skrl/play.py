@@ -30,8 +30,6 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to a .pt checkpoint.")
 parser.add_argument("--num_episodes", type=int, default=5, help="Episodes to roll out.")
-parser.add_argument("--stochastic", action="store_true", default=False,
-                    help="Sample actions instead of using the distribution mean.")
 parser.add_argument("--ml_framework", type=str, default="torch", choices=["torch", "jax"])
 parser.add_argument("--video", action="store_true", default=False, help="Record a video.")
 parser.add_argument("--video_length", type=int, default=500)
@@ -128,9 +126,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
 
     with torch.no_grad():
         for t in range(total_steps):
-            actions, outputs = runner.agent.act(observations, states, timestep=t, timesteps=total_steps)
-            if not args_cli.stochastic and isinstance(outputs, dict) and outputs.get("mean_actions") is not None:
-                actions = outputs["mean_actions"]
+            # Never collapse to the distribution mean: policy gradient is derived for
+            # the stochastic policy, so that's the only one it's valid to evaluate.
+            actions, _ = runner.agent.act(observations, states, timestep=t, timesteps=total_steps)
             observations, rewards, terminated, truncated, _ = env.step(actions)
             states = env.state()
             returns += rewards.reshape(-1)

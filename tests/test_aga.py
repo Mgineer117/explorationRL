@@ -40,7 +40,8 @@ stub.POINTMAZE_V1_MAP = POINTMAZE_V1_MAP
 stub.CELL_SIZE = 1.0
 sys.modules["explorationRL.tasks.direct.pointmaze.pointmaze_env_cfg"] = stub
 
-from explorationRL.agents.skrl.aga import _MazeCells, _return_to_go  # noqa: E402
+from explorationRL.agents.skrl.aga import _MazeCells  # noqa: E402
+from explorationRL.agents.skrl.common import return_to_go  # noqa: E402
 
 device = torch.device("cpu")
 
@@ -65,7 +66,7 @@ check("bottleneck reward is 0/1 valued", set(maze.bottleneck_reward.tolist()) <=
 gamma = 0.5
 b_t = torch.tensor([[1.0], [0.0], [1.0], [0.0]])  # (T=4, N=1)
 dones = torch.tensor([[False], [True], [False], [False]])
-G = _return_to_go(b_t, dones, gamma)
+G = return_to_go(b_t, dones, gamma)
 # episode 1 = steps 0..1: G[1]=0, G[0]=1 + 0.5*0 = 1
 # episode 2 = steps 2..3: G[3]=0, G[2]=1 + 0.5*0 = 1
 expected_G = torch.tensor([[1.0], [0.0], [1.0], [0.0]])
@@ -73,7 +74,7 @@ check("return-to-go resets at dones", torch.allclose(G, expected_G), f"got {G.fl
 
 b_t2 = torch.tensor([[0.0], [0.0], [1.0]])
 dones2 = torch.tensor([[False], [False], [False]])
-G2 = _return_to_go(b_t2, dones2, gamma)
+G2 = return_to_go(b_t2, dones2, gamma)
 # G2[2]=1, G2[1]=0+0.5*1=0.5, G2[0]=0+0.5*0.5=0.25 — credits *approaching* a
 # target cell, not just occupying one (spec property #1).
 expected_G2 = torch.tensor([[0.25], [0.5], [1.0]])
@@ -107,6 +108,23 @@ g_neg = precond(delta_neg)
 proj_neg = torch.dot(v_hat, delta_neg).item()
 check("proj<0 branch damps but keeps sign (PD, eigenvalue 1-damp in (0,1])",
       0.0 < torch.dot(v_hat, g_neg).item() / proj_neg <= 1.0)
+
+# ── 4. smoothed branch (precond_tau>0) stays inside the PD bounds and is
+#      continuous through proj=0, unlike the hard sign() switch ──────────── #
+def precond_smooth(delta: torch.Tensor, tau: float) -> torch.Tensor:
+    proj = torch.dot(v_hat, delta)
+    t = torch.tanh(proj / tau)
+    scale = 0.5 * (beta + damp) * t + 0.5 * (beta - damp)
+    return delta + scale * proj * v_hat
+
+check("smoothed branch: delta_ppo=0 is still an exact fixed point",
+      torch.allclose(precond_smooth(torch.zeros(d), tau=1.0), torch.zeros(d)))
+
+eps = torch.tensor(1e-6)
+g_lo = precond_smooth(-eps * v_hat, tau=1.0)
+g_hi = precond_smooth(eps * v_hat, tau=1.0)
+check("smoothed branch has no jump across proj=0 (hard switch would)",
+      torch.allclose(g_lo, -g_hi, atol=1e-5), f"got {g_lo.tolist()} vs {-g_hi}")
 
 print(f"\n{len(fails)} failure(s)." if fails else "\nAll checks passed.")
 sys.exit(1 if fails else 0)

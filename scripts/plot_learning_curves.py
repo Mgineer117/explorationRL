@@ -29,7 +29,11 @@ T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("runs", nargs="+", metavar="LABEL=RUN_DIR")
-parser.add_argument("--tag", default="Reward / Total reward (mean)")
+parser.add_argument("--tag", default="Reward / True total reward (mean)",
+                    help="Falls back to 'Reward / Total reward (mean)' (skrl's own tag) for runs "
+                         "with no IntrinsicRewardWrapper -- there the two are identical anyway, "
+                         "since nothing blended a bonus into the reward the trainer saw.")
+FALLBACK_TAG = "Reward / Total reward (mean)"
 parser.add_argument("--out", default="logs/skrl/learning_curves.png")
 parser.add_argument("--smooth", type=int, default=25, help="Moving-average window (updates).")
 parser.add_argument("--ylabel", default=None)
@@ -40,7 +44,10 @@ def scalars(run_dir: str, tag: str):
     ea = EventAccumulator(run_dir)
     ea.Reload()
     if tag not in ea.Tags()["scalars"]:
-        raise SystemExit(f"{run_dir}: no scalar {tag!r} (have {ea.Tags()['scalars']})")
+        if tag != FALLBACK_TAG and FALLBACK_TAG in ea.Tags()["scalars"]:
+            tag = FALLBACK_TAG
+        else:
+            raise SystemExit(f"{run_dir}: no scalar {tag!r} (have {ea.Tags()['scalars']})")
     ev = ea.Scalars(tag)
     return np.array([e.step for e in ev], float), np.array([e.value for e in ev], float)
 

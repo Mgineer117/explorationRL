@@ -16,6 +16,19 @@ def flat_params(model: nn.Module) -> torch.Tensor:
     return torch.cat([p.data.view(-1) for p in model.parameters()])
 
 
+def return_to_go(b_t: torch.Tensor, dones: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Discounted return-to-go over a ``(T, N)`` batch, reset at episode ends
+    (``dones[t]`` marks the terminal step of an episode, matching the convention
+    of ``estimate_advantages``/``compute_gae`` below)."""
+    T = b_t.shape[0]
+    G = torch.zeros_like(b_t)
+    running = torch.zeros(b_t.shape[1], device=b_t.device)
+    for t in reversed(range(T)):
+        running = b_t[t] + gamma * running * (~dones[t]).float()
+        G[t] = running
+    return G
+
+
 def set_flat_params(model: nn.Module, flat: torch.Tensor) -> None:
     """Write a 1-D tensor produced by :func:`flat_params` back into ``model``."""
     idx = 0

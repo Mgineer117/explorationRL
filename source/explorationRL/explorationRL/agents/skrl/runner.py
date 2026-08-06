@@ -2,7 +2,7 @@
 
 The PPO / TRPO / SAC baselines are resolved entirely by stock skrl. This subclass
 adds two things so the ported research algorithms (DRND, PSNE, HTRPO, IRPO, HRL,
-MAML, AGA) can be selected from a yaml exactly like a built-in:
+MAML, AGA, PGNoCritic) can be selected from a yaml exactly like a built-in:
 
 1. ``_COMPONENT_REGISTRY`` — a ``name -> factory`` table consulted before skrl's
    own ``_component`` lookup. Each algorithm registers its agent class under
@@ -13,6 +13,11 @@ MAML, AGA) can be selected from a yaml exactly like a built-in:
    fall through it with no ``agent_cfg``/``agent_kwargs`` bound. The override
    below reproduces skrl's single-agent construction path for registered custom
    agents and delegates everything else to ``super()``.
+
+3. ``_generate_models`` — a top-level yaml ``zero_init_critic: true`` zeroes the
+   value model's output head right after construction (works for ANY agent,
+   including stock PPO, and both ``models.separate`` true/false), so ``V(s)=0``
+   at init instead of arbitrary/noisy — see ``_zero_init_value_head``.
 
 Note the one deliberate difference from skrl's path: the config dataclass is
 passed as an *instance* rather than ``dataclasses.asdict(...)``. skrl's agents do
@@ -25,7 +30,30 @@ from __future__ import annotations
 
 from typing import Callable
 
+import torch.nn as nn
 from skrl.utils.runner.torch import Runner
+
+
+def _zero_init_value_head(model: nn.Module) -> None:
+    """Zero the final linear layer that outputs the scalar value estimate, so
+    ``V(s) = 0`` for every state at init instead of an arbitrary/noisy value --
+    an early GAE advantage then reduces to the plain (undiscounted-by-critic)
+    reward until the critic has actually learned something, rather than being
+    driven by an untrained critic's noise (see ``pg_no_critic.py``'s docstring
+    for the motivating hypothesis: this targets the same noise source without
+    removing the critic entirely).
+
+    Handles both a standalone value model (zeroes its last ``nn.Linear``) and
+    skrl's shared actor-critic model (``models.separate: false``, which exposes
+    a dedicated ``value_layer`` head after ``init_state_dict`` resolves its lazy
+    shape -- zeroing it leaves the policy head and shared trunk untouched)."""
+    head = getattr(model, "value_layer", None)
+    if head is None:
+        linears = [m for m in model.modules() if isinstance(m, nn.Linear)]
+        head = linears[-1] if linears else None
+    if head is not None:
+        nn.init.zeros_(head.weight)
+        nn.init.zeros_(head.bias)
 
 
 def _drnd_agent():
@@ -74,6 +102,18 @@ def _aga_cfg():
     from explorationRL.agents.skrl.aga import AGA_CFG
 
     return AGA_CFG
+
+
+def _pgnc_agent():
+    from explorationRL.agents.skrl.pg_no_critic import PGNoCritic
+
+    return PGNoCritic
+
+
+def _pgnc_cfg():
+    from explorationRL.agents.skrl.pg_no_critic import PGNC_CFG
+
+    return PGNC_CFG
 
 
 def _hrl_agent():
@@ -126,6 +166,8 @@ class ExplorationRunner(Runner):
         "irpo_cfg": _irpo_cfg,
         "aga": _aga_agent,
         "aga_cfg": _aga_cfg,
+        "pgnocritic": _pgnc_agent,
+        "pgnocritic_cfg": _pgnc_cfg,
         "hrl": _hrl_agent,
         "hrl_cfg": _hrl_cfg,
         "maml": _maml_agent,
@@ -146,6 +188,15 @@ class ExplorationRunner(Runner):
         if factory is not None:
             return factory()
         return super()._component(name)
+
+    def _generate_models(self, env, cfg: dict):
+        models = super()._generate_models(env, cfg)
+        if bool(cfg.get("zero_init_critic", False)):
+            for roles in models.values():
+                value_model = roles.get("value")
+                if value_model is not None:
+                    _zero_init_value_head(value_model)
+        return models
 
     def _generate_agent(self, env, cfg: dict, models: dict):
         agent_class = str(cfg.get("agent", {}).get("class", "")).lower()
