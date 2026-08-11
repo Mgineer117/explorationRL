@@ -13,6 +13,13 @@ Exits non-zero if any check fails.
 
 from __future__ import annotations
 
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "skrl"))
+from train_utils import apply_wandb_sweep_overrides  # noqa: E402
+
 fails: list[str] = []
 
 
@@ -56,6 +63,27 @@ check("restoring via the found owner reaches the inner wrapper", inner.reward_sc
 
 check("walk on the owner itself (no wrapping) finds itself", find_scale_owner(inner) is inner)
 check("walk on an env with no reward_scale anywhere returns None", find_scale_owner(Outer(Outer(None))) is None)
+
+# apply_wandb_sweep_overrides: dotted keys -> agent_cfg, "seed" -> agent_cfg,
+# a bare key matching an args_cli attribute -> setattr(args_cli, ...) (needed
+# for flags like --int_reward_coef that aren't part of the agent config at
+# all, see search/configs/ppo_allogoal.yaml), anything else is ignored.
+import wandb
+
+wandb.init(mode="disabled", config={
+    "agent.discount_factor": 0.99,
+    "seed": 7,
+    "int_reward_coef": 0.3,
+    "not_a_real_arg": 123,
+})
+agent_cfg = {"agent": {"discount_factor": 0.95}, "seed": 42}
+args_cli = argparse.Namespace(int_reward_coef=0.1, algorithm="ppo_allogoal")
+apply_wandb_sweep_overrides(agent_cfg, args_cli)
+check("dotted key overrides agent_cfg", agent_cfg["agent"]["discount_factor"] == 0.99)
+check("'seed' overrides agent_cfg", agent_cfg["seed"] == 7)
+check("bare key matching an args_cli attr overrides it", args_cli.int_reward_coef == 0.3)
+check("bare key with no matching args_cli attr is ignored, no crash", args_cli.algorithm == "ppo_allogoal")
+wandb.finish()
 
 print("\n" + ("ALL PASSED" if not fails else f"FAILED: {fails}"))
 raise SystemExit(1 if fails else 0)

@@ -97,6 +97,7 @@ def build(algorithm: str, env: str, *, method: str, project: str) -> dict:
         "--algorithm", str(cfg["algorithm"]),
         "--num_envs", str(cfg["num_envs"]),
     ]
+    command += [str(a) for a in cfg.get("extra_args", [])]
     command.append("${args}")
 
     return {

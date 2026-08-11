@@ -1,10 +1,13 @@
-label: ppo
-algorithm: ppo
+label: ppo+allog
+algorithm: ppo_allogoal
 # PPO is on-policy and benefits from massively parallel envs.
 num_envs: 4096
 
+extra_args: ["--agent", "skrl_ppo_cfg_entry_point", "--int_reward", "allo_kernel",
+             "--allo_positional_indices", "0", "1", "--goal_indices", "6", "7"]
+
 metric:
-  name: "Reward / Total reward (mean)"
+  name: "Reward / True total reward (mean)"
   goal: maximize
 
 parameters:
@@ -30,8 +33,13 @@ parameters:
     values: [0.5, 1.0, 2.0]
   agent.grad_norm_clip:
     values: [0.5, 1.0, 2.0]
-  # Initial policy std (exp(initial_log_std)) -- how much the policy explores
-  # before any training. 0.0 was the untested fixed default across every run
-  # this whole investigation traced exploration collapse in.
   models.policy.initial_log_std:
     values: [-1.0, 0.0, 1.0]
+  # Bare key (no "agent." prefix): int_reward_coef isn't part of the agent
+  # config, it's train.py's own --int_reward_coef flag (how strongly the
+  # ALLOGoal potential is blended into the training reward, see
+  # apply_wandb_sweep_overrides). 0.1 was an arbitrary fixed guess before;
+  # searching it directly tests whether the reward-blending pathway just
+  # needed a different scale, not only different PPO hyperparameters.
+  int_reward_coef:
+    values: [0.01, 0.03, 0.1, 0.3, 1.0]

@@ -32,14 +32,19 @@ def _set_dotted(cfg: dict, dotted_key: str, value) -> None:
     node[parts[-1]] = value
 
 
-def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
-    """Write every ``wandb.config`` entry into ``agent_cfg`` by dotted key.
+def apply_wandb_sweep_overrides(agent_cfg: dict, args_cli=None) -> None:
+    """Write every ``wandb.config`` entry into ``agent_cfg`` by dotted key, or
+    onto ``args_cli`` for a bare key matching one of its own attributes.
 
     A W&B sweep sets its sampled hyperparameters on ``wandb.config`` with keys
     like ``agent.discount_factor`` or ``models.policy.network`` (see
-    ``search/configs/``). They only exist once the run is live, and must reach
-    ``agent_cfg`` before any model is built from it — train.py calls this right
-    after ``wandb.init`` for a sweep.
+    ``search/configs/``) -- those dotted keys land in ``agent_cfg``. A bare key
+    (no dot) is for something ``train.py``'s own argparse namespace holds
+    instead, e.g. ``int_reward_coef`` -- not part of the agent config, so
+    there is nothing under ``agent.*``/``models.*`` to dot into. They only
+    exist once the run is live, and must reach their target before any model
+    is built from it -- train.py calls this right after ``wandb.init`` for a
+    sweep.
     """
     try:
         import wandb
@@ -52,6 +57,8 @@ def apply_wandb_sweep_overrides(agent_cfg: dict) -> None:
             _set_dotted(agent_cfg, key, value)
         elif key in ("seed",):
             agent_cfg[key] = value
+        elif args_cli is not None and hasattr(args_cli, key):
+            setattr(args_cli, key, value)
 
 
 def install_wandb_scalar_hook() -> None:

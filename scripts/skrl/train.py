@@ -254,7 +254,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: dict):
         import wandb
         if wandb.run is None:
             wandb.init(project=args_cli.wandb_project, sync_tensorboard=True)
-        apply_wandb_sweep_overrides(agent_cfg)
+        apply_wandb_sweep_overrides(agent_cfg, args_cli)
         _apply_agent_overrides(agent_cfg)  # CLI still wins over the sampled trial
         experiment["wandb"] = False
         install_wandb_scalar_hook()

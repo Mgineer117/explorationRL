@@ -24,6 +24,12 @@ parameters:        # verbatim W&B sweep `parameters:` block; keys are DOTTED pat
 method: bayes      # bayes (default) | grid | random. grid needs every parameter
                    # discrete (a `values:` list) — build_sweep.py rejects a grid
                    # config that still declares a continuous `distribution:`.
+
+extra_args:        # fixed (unswept) CLI flags spliced into every trial's command,
+  - "--agent"      # right after --num_envs and before the sweep's own ${args}.
+  - "skrl_ppo_cfg_entry_point"   # for flags train.py needs that aren't agent.*/
+  - "--int_reward"               # models.* config keys (e.g. --agent, --int_reward,
+  - "drnd"                       # --int_reward_coef) and aren't themselves searched.
 ```
 
 The dotted parameter keys (`agent.discount_factor`, …) are written straight onto
